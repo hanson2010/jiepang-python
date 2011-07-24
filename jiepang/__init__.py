@@ -4,8 +4,10 @@ Jiepang API Python module
 by Haisheng HU <hanson2010@gmail.com>
 https://github.com/hanson2010/jiepang-python
 
+version 0.2
+ * OAuth 2.0 support
 version 0.1
- * basic functions
+ * Basic functions
 
 Jiepang API doc
 http://dev.jiepang.com/doc
@@ -15,23 +17,24 @@ http://code.google.com/p/jiepang-api/wiki/Documentation
 import httplib
 import urllib
 import string
-import sys
-import logging
-import base64
-from django.utils import simplejson
 
-API_PROTOCOL = 'http'
+try:
+    import json
+    simplejson = json
+except ImportError:
+    try: 
+        import simplejson
+    except ImportError:
+        from django.utils import simplejson
+
+#import logging
+
+AUTHORIZATION_URI = 'https://jiepang.com/oauth/authorize'
+TOKEN_URI = 'https://jiepang.com/oauth/token'
+
 API_SERVER   = 'api.jiepang.com'
-API_VERSION  = 'v1'
-API_SOURCE   = 'checkinsync'
+API_URL_TEMPLATE = string.Template('http://%s/v1/${method}' % (API_SERVER))
 
-API_URL_TEMPLATE = string.Template(
-    API_PROTOCOL + '://' + API_SERVER + '/' + API_VERSION + '/${method}'
-)
-POST_HEADERS = {
-    'Content-type': 'application/x-www-form-urlencoded',
-    'Accept'      : 'text/plain'
-}
 JIEPANG_METHODS = {}
 
 def def_method(name,
@@ -65,6 +68,7 @@ def_method('switchcity',
 Check in methods
 '''
 def_method('statuses__list',
+           auth_required=True,
            required=['type'],
            optional=['count', 'id'])
 
@@ -187,54 +191,6 @@ def_method('findfriends_bytwitter',
            auth_required=True,
            optional=['q'])
 
-def merge_dicts(a, b):
-    if a == None:
-        return b
-    if b == None:
-        return a
-    r = {}
-    for key, value in a.items():
-        r[key] = value
-    for key, value in b.items():
-        r[key] = value
-    return r
-
-class Credentials:
-    pass
-
-class BasicCredentials(Credentials):
-    def __init__(self, username, password):
-        self.username = username
-        self.password = password
- 
-    def build_request(self, http_method, url, parameters):
-        # Need to strip the newline off.
-        auth_string = base64.encodestring('%s:%s' % (self.username, self.password))[:-1]
-        query = urllib.urlencode(parameters)
-        if http_method == 'POST':
-            args = query
-        else:
-            args = None
-        return url+ '?' + query, args, {'Authorization': 'Basic %s' % (auth_string,)}
- 
-    def authorized(self):
-        return True
-
-class NullCredentials(Credentials):
-    def __init__(self):
-        pass
-
-    def authorized(self):
-        return False
-
-    def build_request(self, http_method, url, parameters):
-        query = urllib.urlencode(parameters)
-        if http_method == 'POST':
-            args = query
-        else:
-            args = None
-        return url + '?' + query, args, {}
-
 class JiepangException(Exception):
     pass
  
@@ -250,9 +206,9 @@ class JiepangRemoteException(JiepangException):
 '''
 Used as a proxy for methods of the Jiepang class; when methods
 are called, __call__ in JiepangAccumulator is called, ultimately
-calling the foursquare_obj's callMethod()
+calling the jiepang_obj's callMethod()
 '''
-class JiepangAccumulator:
+class JiepangAccumulator(object):
     def __init__(self, jiepang_obj, name):
         self.jiepang_obj = jiepang_obj
         self.name = name
@@ -263,24 +219,34 @@ class JiepangAccumulator:
     def __call__(self, *args, **kw):
         return self.jiepang_obj.call_method(self.name, *args, **kw)
 
-class Jiepang:
-    def __init__(self, credentials=None):
-        if credentials:
-            self.credentials = credentials
-        else:
-            self.credentials = NullCredentials()
- 
+class JiepangClient(object):
+    _access_token = ''
+
+    def __init__(self, access_token=''):
+        if access_token:
+            self._access_token = access_token
         for method in JIEPANG_METHODS:
             if not hasattr(self, method):
                 setattr(self, method, JiepangAccumulator(self, method))
 
+    def get_access_token(self):
+        return self._access_token
+
+    def build_request(self, http_method, url, params):
+        query = urllib.urlencode(params)
+        if http_method == 'POST':
+            body = query
+        else:
+            body = None
+        return '%s?%s' % (url, query), body
+
     def get_http_connection(self, server):
         return httplib.HTTPConnection(server)
 
-    def fetch_response(self, server, http_method, url, body=None, headers=None):
+    def fetch_response(self, server, http_method, url, body=None):
         http_connection = self.get_http_connection(server)
-        if (body is not None) or (headers is not None):
-            http_connection.request(http_method, url, body, merge_dicts(POST_HEADERS, headers))
+        if body:
+            http_connection.request(http_method, url, body)
         else:
             http_connection.request(http_method, url)
         response = http_connection.getresponse()
@@ -290,10 +256,8 @@ class Jiepang:
         return response_body
 
     def call_method(self, method, *args, **kw):
-        logging.debug('Calling jiepang method %s %s %s' % (method, args, kw))
+#        logging.debug('Calling jiepang method %s %s %s' % (method, args, kw))
         meta = JIEPANG_METHODS[method]
-        if meta['auth_required'] and (not self.credentials or not self.credentials.authorized()):
-            raise JiepangException('Remote method %s requires authorization.' % (`method`,))
         if args:
             names = meta['required'] + meta['optional']
             for i in xrange(len(args)):
@@ -304,8 +268,12 @@ class Jiepang:
         for arg in kw:
             if (not arg in meta['required']) and (not arg in meta['optional']):
                 raise JiepangException('Unknown argument %s supplied to method %s. Required arguments are %s, optional arguments are %s.' % (arg, method, ', '.join(meta['required']), ', '.join(meta['optional'])))
-        kw['source'] = API_SOURCE
-        cred_url, cred_args, cred_headers = self.credentials.build_request(
+        # Add oauth access token
+        if meta['auth_required']:
+            if not self.get_access_token():
+                raise JiepangException('Remote method %s requires authorization.' % (method))
+            kw['access_token'] = self.get_access_token()
+        cred_url, cred_args = self.build_request(
                 meta['http_method'],
                 meta['url_template'].substitute(method=method.replace('__', '/')),
                 kw
@@ -314,12 +282,10 @@ class Jiepang:
             response = self.fetch_response(API_SERVER,
                                            meta['http_method'],
                                            cred_url,
-                                           body=cred_args,
-                                           headers=cred_headers)
+                                           body=cred_args)
         else:
             response = self.fetch_response(API_SERVER,
                                            meta['http_method'],
-                                           cred_url,
-                                           headers=cred_headers)
+                                           cred_url)
         results = simplejson.loads(response)
         return results
